@@ -153,8 +153,9 @@ Simultaneously search across all available newspaper archives.
 ### Parameters
 
 - **query** (required): Search query (keywords, names, dates, etc.)
-- **date_from** (optional): Start date in YYYY-MM-DD format
-- **date_to** (optional): End date in YYYY-MM-DD format
+- **date_from** (optional): Start date. `YYYY-MM-DD`; `YYYY-MM` and `YYYY` are widened to the whole month/year
+- **date_to** (optional): End date, same formats; bounds are inclusive
+- **newspaper** (optional): Limit to one title by exact name, e.g. `De Noord-Ooster` (Delpher only)
 - **page** (optional): Page number for paginated results (default: 1)
 - **rows** (optional): Number of results per page (default: 20)
 
@@ -241,6 +242,31 @@ Error response:
 ```
 
 ## Archives Details
+
+### Delpher (KB, Netherlands)
+
+The Delpher provider talks to the KB SRU endpoint (`jsru.kb.nl/sru/sru`, `x-collection=DDD_artikel`)
+and has to work around several undocumented behaviours that otherwise fail *silently*:
+
+| Query form | Effect |
+|---|---|
+| `date_from=1932-02-23`, `date_to=1932-02-23` | Works: sent as `date = "1932-02-23"`. The KB **ignores** `date within "A A"` when both bounds are equal and returns the unfiltered total |
+| `date_from=1932-01-01`, `date_to=1932-12-31` | Works: `date within "…"`, both bounds inclusive |
+| `date="1932"` / `date="1932-02"` in a raw query | Ignored by the KB — only full ISO dates are understood, so the provider widens year/month input itself |
+| bare `Emmer courant` | Invalid CQL, 0 records — the provider AND-joins plain words |
+| `"Emmer courant"` plus any date clause | Always 0 records at the KB, hence the AND-join instead of a phrase |
+| `papertitle="De Noord-Ooster"` (via `newspaper=`) | Exact title filter |
+
+Every result header prints the `Effective CQL:` it sent, so a filter the KB dropped shows up
+instead of looking like a clean result. Queries that already look like CQL (`AND`, `=`, quotes)
+are passed through untouched.
+
+Snippets: the KB resolver serves page masters as **JPEG-2000** (5–10 MB), which most clients cannot
+render. `newspapers_get_snippet` converts them to JPEG (max 1600 px) with ImageMagick — `magick`
+must be on `PATH` — and crops to `snippet_coords` given as `x,y,w,h` in page pixels.
+
+Run `npm run test:delpher` against a live KB to check dates, the newspaper filter and the
+JPEG conversion end to end.
 
 ### Europeana
 - Coverage: Multiple European countries

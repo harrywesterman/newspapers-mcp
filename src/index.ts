@@ -6,6 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { z } from "zod";
 import axios from "axios";
+import { spawnSync } from "node:child_process";
 import express from "express";
 import cors from "cors";
 import { NoOpOAuthProvider } from "./oauth-provider.js";
@@ -48,9 +49,10 @@ const searchSchema = z.object({
     "digitalnz",
     "internet_archive",
   ]).default("all").describe("Which newspaper archive to search. Use 'all' to search all archives simultaneously."),
-  query: z.string().describe("Search query (keywords, names, dates)"),
-  date_from: z.string().optional().describe("Start date (YYYY-MM-DD format)"),
-  date_to: z.string().optional().describe("End date (YYYY-MM-DD format)"),
+  query: z.string().describe("Search query. Plain words are searched as a phrase; raw CQL (e.g. 'papertitle=\"De Noord-Ooster\" AND Westerman') is passed through unchanged"),
+  date_from: z.string().optional().describe("Start date: YYYY-MM-DD (YYYY and YYYY-MM also accepted, widened to the whole year/month)"),
+  date_to: z.string().optional().describe("End date: YYYY-MM-DD (YYYY and YYYY-MM also accepted, widened to the whole year/month)"),
+  newspaper: z.string().optional().describe("Limit to one newspaper title, e.g. 'De Noord-Ooster' or 'Emmer courant' (exact title, no quotes needed)"),
   page: z.number().optional().default(1).describe("Page number for results"),
   rows: z.number().optional().default(20).describe("Number of results per page"),
 });
@@ -64,7 +66,7 @@ server.registerTool(
     description: "Search historical newspaper archives across multiple countries. Sources: europeana (Europe-wide), gallica (France/BnF), ddb (Germany/DDB), digipress (Germany/BSB), british_library (UK catalogue), anno (Austria/ANNO), delpher (Netherlands/KB), chronicling_america (USA/LoC), trove (Australia/NLA, requires TROVE_API_KEY), eluxemburgensia (Luxembourg/BnL), norwegian (Norway/nb.no), digitalnz (New Zealand/Papers Past), internet_archive (Internet Archive newspapers), south_african (links only). Use source='all' to search all simultaneously.",
     inputSchema: searchSchema,
   },
-  async ({ source, query, date_from, date_to, page = 1, rows = 20 }) => {
+  async ({ source, query, date_from, date_to, newspaper, page = 1, rows = 20 }) => {
     try {
       if (source === "all") {
         const archives = [
@@ -76,7 +78,7 @@ server.registerTool(
           { name: "Internet Archive", fn: () => searchInternetArchiveFull(query, date_from, date_to, page, Math.min(rows, 5)) },
           { name: "Chronicling America", fn: () => searchChroniclingAmericaFull(query, date_from, date_to, page, Math.min(rows, 5)) },
           { name: "ANNO", fn: () => searchAnnoFull(query, date_from, date_to, page, Math.min(rows, 5)) },
-          { name: "Delpher", fn: () => searchDelpherFull(query, date_from, date_to, page, Math.min(rows, 5)) },
+          { name: "Delpher", fn: () => searchDelpherFull(query, date_from, date_to, page, Math.min(rows, 5), newspaper) },
           { name: "DDB", fn: () => searchDdbFull(query, date_from, date_to, page, Math.min(rows, 5)) },
           { name: "Trove", fn: () => searchTroveFull(query, date_from, date_to, page, Math.min(rows, 5)) },
           { name: "eLuxemburgensia", fn: () => searchEluxemburgensiaFull(query, date_from, date_to, page, Math.min(rows, 5)) },
@@ -115,7 +117,7 @@ server.registerTool(
           result = await searchAnnoFull(query, date_from, date_to, page, rows);
           break;
         case "delpher":
-          result = await searchDelpherFull(query, date_from, date_to, page, rows);
+          result = await searchDelpherFull(query, date_from, date_to, page, rows, newspaper);
           break;
         case "chronicling_america":
           result = await searchChroniclingAmericaFull(query, date_from, date_to, page, rows);
@@ -170,7 +172,7 @@ server.registerTool(
   "newspapers_get_snippet",
   {
     title: "Get Newspaper Snippet Image",
-    description: "Fetch a newspaper snippet image and return it as base64. Use with snippet coordinates from search results. Supported sources: digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia.",
+    description: "Fetch a newspaper snippet image and return it as base64. Use with snippet coordinates from search results. Supported sources: digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia. Delpher pages are served as JPEG-2000 masters and are converted to JPEG (max 1600px) before returning.",
     inputSchema: z.object({
       source: z.enum(["digipress", "chronicling_america", "gallica", "europeana", "anno", "delpher", "ddb", "eluxemburgensia"])
         .describe("The archive source (digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia)"),
@@ -183,6 +185,7 @@ server.registerTool(
   async ({ source, document_id, snippet_coords }) => {
     try {
       let imageUrl: string;
+      let convertToJpeg = false;
       const region = snippet_coords || "full";
 
       switch (source) {
@@ -214,8 +217,10 @@ server.registerTool(
           break;
         }
         case "delpher":
-          // KB Netherlands resolver returns JP2 page images
+          // KB Netherlands resolver returns JP2 page masters (5-10 MB) that most clients
+          // cannot render; they are converted to JPEG below.
           imageUrl = `https://resolver.kb.nl/resolve?urn=${encodeURIComponent(document_id)}:image`;
+          convertToJpeg = true;
           break;
         case "ddb":
           // DDB binary endpoint returns thumbnails/images by UUID
@@ -230,12 +235,39 @@ server.registerTool(
       const response = await axios.get(imageUrl, {
         responseType: "arraybuffer",
         headers: { "User-Agent": "newspapers-mcp/1.0" },
-        timeout: 30000,
+        timeout: 60000,
       });
 
       const contentType = String(response.headers["content-type"] || "image/jpeg");
-      const mimeType = contentType.split(";")[0].trim();
-      const base64 = Buffer.from(response.data).toString("base64");
+      let bytes = Buffer.from(response.data);
+      let mimeType = contentType.split(";")[0].trim();
+
+      if (convertToJpeg || /jp2|jpeg\s*-?\s*2000/i.test(mimeType)) {
+        // Craft a JPEG (optionally cropped to snippet_coords "x,y,w,h" in page pixels) so the
+        // client can actually display it; JP2 masters are 5-10 MB and rarely supported.
+        const cropArgs: string[] = [];
+        if (snippet_coords) {
+          const n = snippet_coords.split(",").map(v => Number(v.trim()));
+          if (n.length === 4 && n.every(v => Number.isFinite(v)) && n[2] > 0 && n[3] > 0) {
+            cropArgs.push("-crop", `${n[2]}x${n[3]}+${n[0]}+${n[1]}`, "+repage");
+          }
+        }
+        const conv = spawnSync(
+          "magick",
+          ["-", ...cropArgs, "-resize", "1600x1600>", "-quality", "82", "jpg:-"],
+          { input: bytes, maxBuffer: 512 * 1024 * 1024 },
+        );
+        if (conv.status === 0 && conv.stdout && conv.stdout.length > 0) {
+          bytes = conv.stdout as Buffer;
+          mimeType = "image/jpeg";
+        } else {
+          const detail = conv.stderr ? conv.stderr.toString().slice(0, 300) : `exit ${conv.status}`;
+          console.error(`JPEG conversion failed: ${detail}`);
+          throw new Error(`JPEG conversion failed (${detail}); raw image is ${mimeType}`);
+        }
+      }
+
+      const base64 = bytes.toString("base64");
 
       return {
         content: [
