@@ -57,6 +57,26 @@ const searchSchema = z.object({
   rows: z.number().optional().default(20).describe("Number of results per page"),
 });
 
+/**
+ * Fetch OCR text for a Delpher item. The `:ocr` representation exists for article ids
+ * (`…:a0108`) but not for page ids (`…:p00004`), which is why this is a fallback and not
+ * a substitute for a snippet image.
+ */
+async function fetchDelpherOcr(documentId: string): Promise<string | undefined> {
+  try {
+    const response = await axios.get(
+      `https://resolver.kb.nl/resolve?urn=${encodeURIComponent(documentId)}:ocr`,
+      { headers: { "User-Agent": "newspapers-mcp/1.0" }, timeout: 10000 },
+    );
+    const paragraphs = [...String(response.data).matchAll(/<p>([\s\S]*?)<\/p>/g)]
+      .map(m => m[1].trim())
+      .filter(Boolean);
+    return paragraphs.length ? paragraphs.join(" ").slice(0, 4000) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function registerTools(server: McpServer) {
 // ========== UNIFIED NEWSPAPER SEARCH ==========
 server.registerTool(
@@ -172,20 +192,20 @@ server.registerTool(
   "newspapers_get_snippet",
   {
     title: "Get Newspaper Snippet Image",
-    description: "Fetch a newspaper snippet image and return it as base64. Use with snippet coordinates from search results. Supported sources: digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia. Delpher pages are served as JPEG-2000 masters and are converted to JPEG (max 1600px) before returning.",
+    description: "Fetch a newspaper snippet image and return it as base64. Use with snippet coordinates from search results. Supported sources: digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia. Delpher pages are fetched as JPEG from Delpher's download API; a crop is applied with ImageMagick and the result is capped at 1600px.",
     inputSchema: z.object({
       source: z.enum(["digipress", "chronicling_america", "gallica", "europeana", "anno", "delpher", "ddb", "eluxemburgensia"])
         .describe("The archive source (digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia)"),
       document_id: z.string()
         .describe("Document/page identifier from the archive (e.g. 'bsb10001591_00035' for digiPress, 'service:ndnp:...:0003' for Chronicling America, 'bpt6k5460422k/f173' for Gallica, full imageURL for ANNO, 'ddd:...:mpeg21:p010' for Delpher, UUID for DDB, 'ark:70795/.../pages/1' for eLuxemburgensia)"),
       snippet_coords: z.string().optional()
-        .describe("IIIF region coordinates for the snippet crop (e.g. 'pct:0,11.5,100,3.6' for digiPress, 'x,y,w,h' pixel coords for Gallica). Not used for ANNO (imageURL already contains crop). If omitted, returns the full page."),
+        .describe("IIIF region coordinates for the snippet crop (e.g. 'pct:0,11.5,100,3.6' for digiPress, 'x,y,w,h' pixel coords for Gallica and Delpher). Not used for ANNO (imageURL already contains crop). Delpher coords are relative to the 6000px-wide page image. If omitted, returns the full page."),
     }),
   },
   async ({ source, document_id, snippet_coords }) => {
     try {
       let imageUrl: string;
-      let convertToJpeg = false;
+      let cropJpeg = false;
       const region = snippet_coords || "full";
 
       switch (source) {
@@ -217,10 +237,11 @@ server.registerTool(
           break;
         }
         case "delpher":
-          // KB Netherlands resolver returns JP2 page masters (5-10 MB) that most clients
-          // cannot render; they are converted to JPEG below.
-          imageUrl = `https://resolver.kb.nl/resolve?urn=${encodeURIComponent(document_id)}:image`;
-          convertToJpeg = true;
+          // The KB resolver's `:image` endpoint was retired (404 for every id). Delpher's
+          // download API still renders JPEGs server-side, so no JP2 conversion is needed.
+          // Fetch a large page when cropping; a small one for a plain full-page snippet.
+          imageUrl = `https://www.delpher.nl/nl/api/downloadimage?id=${encodeURIComponent(document_id + ":image")}&w=${snippet_coords ? 6000 : 1600}`;
+          cropJpeg = Boolean(snippet_coords);
           break;
         case "ddb":
           // DDB binary endpoint returns thumbnails/images by UUID
@@ -236,15 +257,45 @@ server.registerTool(
         responseType: "arraybuffer",
         headers: { "User-Agent": "newspapers-mcp/1.0" },
         timeout: 60000,
+        // Delpher's download API reports failures as a 200 with a text body, but a
+        // future 4xx/5xx should still produce our explicit message, not a bare axios error.
+        ...(source === "delpher" ? { validateStatus: () => true } : {}),
       });
 
       const contentType = String(response.headers["content-type"] || "image/jpeg");
       let bytes = Buffer.from(response.data);
       let mimeType = contentType.split(";")[0].trim();
 
-      if (convertToJpeg || /jp2|jpeg\s*-?\s*2000/i.test(mimeType)) {
-        // Craft a JPEG (optionally cropped to snippet_coords "x,y,w,h" in page pixels) so the
-        // client can actually display it; JP2 masters are 5-10 MB and rarely supported.
+      // Delpher serves `image/jpeg` even for its "Not Found: …" error text, so trust the
+      // bytes, not the content type. Not every page has a served scan: some issues only
+      // expose the issue PDF (`…:mpeg21:pdf`) and OCR.
+      const isJpeg = bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8;
+      if (source === "delpher" && (response.status < 200 || response.status >= 300 || !isJpeg)) {
+        const detail = bytes.toString("utf8").replace(/\s+/g, " ").trim().slice(0, 200)
+          || `HTTP ${response.status}, non-JPEG payload`;
+        const ocr = await fetchDelpherOcr(document_id);
+        if (ocr) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `No page image is available for ${document_id} (${detail}).\n\nOCR text:\n${ocr}`,
+              },
+            ],
+          };
+        }
+        const issueId = document_id.replace(/:p\d+$/, "");
+        throw new Error(
+          `KB image route unavailable for ${document_id}: ${detail}. ` +
+          `Delpher does not serve a page scan for this id; the issue PDF may still be available at ` +
+          `https://resolver.kb.nl/resolve?urn=${issueId}:pdf.`,
+        );
+      }
+
+      if (cropJpeg || /jp2|jpeg\s*-?\s*2000/i.test(mimeType)) {
+        // Crop to snippet_coords "x,y,w,h" in page pixels and cap the result at 1600 px.
+        // JPEG-2000 payloads from other sources are converted here too, since most clients
+        // cannot display them.
         const cropArgs: string[] = [];
         if (snippet_coords) {
           const n = snippet_coords.split(",").map(v => Number(v.trim()));

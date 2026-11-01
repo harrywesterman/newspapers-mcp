@@ -261,12 +261,18 @@ Every result header prints the `Effective CQL:` it sent, so a filter the KB drop
 instead of looking like a clean result. Queries that already look like CQL (`AND`, `=`, quotes)
 are passed through untouched.
 
-Snippets: the KB resolver serves page masters as **JPEG-2000** (5–10 MB), which most clients cannot
-render. `newspapers_get_snippet` converts them to JPEG (max 1600 px) with ImageMagick — `magick`
-must be on `PATH` — and crops to `snippet_coords` given as `x,y,w,h` in page pixels.
+Snippets: the old KB resolver `:image` route is retired and returns 404 for every id. The provider
+instead requests a server-rendered JPEG from Delpher's download API
+(`/nl/api/downloadimage?id=…:image&w=…`). Full pages are fetched at 1600 px; with `snippet_coords`
+the page is fetched at 6000 px and cropped with ImageMagick (`magick` must be on `PATH`), with
+`x,y,w,h` interpreted in that 6000 px coordinate space, then capped at 1600 px.
 
-Run `npm run test:delpher` against a live KB to check dates, the newspaper filter and the
-JPEG conversion end to end.
+Not every page has a served scan: some issues (e.g. `ddd:010327636`) only expose the issue PDF and
+OCR. In that case `newspapers_get_snippet` returns an explicit `KB image route unavailable` message
+instead of a raw axios 404, and for article ids (`…:a0108`) it falls back to the `:ocr` text.
+
+Run `npm run test:delpher` against a live KB to check dates, the newspaper filter and
+snippet fetching end to end.
 
 ### Europeana
 - Coverage: Multiple European countries

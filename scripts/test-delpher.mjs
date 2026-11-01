@@ -6,7 +6,7 @@
  *   npm run build && node scripts/test-delpher.mjs
  *
  * Live archive data: assertions are about shape and filtering, not about exact hit counts.
- * Requires ImageMagick (`magick`) on PATH for the snippet conversion test.
+ * Requires ImageMagick (`magick`) on PATH for the snippet crop test.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -57,7 +57,7 @@ check("hits come from that paper", papers(t).length > 0 && papers(t).every(p => 
 t = await search({ query: 'papertitle="De Noord-Ooster" AND Emmen', date_from: "1932-02-20", date_to: "1932-02-29", rows: 2 });
 check("raw CQL passthrough", t.includes('papertitle="De Noord-Ooster" AND Emmen AND date within'));
 
-// 6. snippets: KB serves JP2, the server must hand back a JPEG
+// 6. snippets: Delpher's download API serves JPEG, the server must hand it back (cropped on request)
 for (const [label, coords] of [["full page", undefined], ["crop", "600,300,900,400"]]) {
   const r = await client.callTool({
     name: "newspapers_get_snippet",
@@ -72,6 +72,18 @@ for (const [label, coords] of [["full page", undefined], ["crop", "600,300,900,4
   const jpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[buf.length - 2] === 0xff && buf[buf.length - 1] === 0xd9;
   check(`snippet ${label} is JPEG`, img.mimeType === "image/jpeg" && jpeg && buf.length > 10_000, `${img.mimeType}, ${buf.length} bytes`);
 }
+
+// 7. a page without a served scan must fail explicitly, not with a bare axios 404
+const unavailable = await client.callTool({
+  name: "newspapers_get_snippet",
+  arguments: { source: "delpher", document_id: "ddd:000000000:mpeg21:p00001" },
+});
+const unavailableText = text(unavailable);
+check(
+  "unavailable scan fails explicitly",
+  !unavailable.content.some(c => c.type === "image") && unavailableText.includes("KB image route unavailable"),
+  unavailableText.slice(0, 200),
+);
 
 await client.close();
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");
