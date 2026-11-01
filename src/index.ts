@@ -7,6 +7,10 @@ import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { z } from "zod";
 import axios from "axios";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import express from "express";
 import cors from "cors";
 import { NoOpOAuthProvider } from "./oauth-provider.js";
@@ -74,6 +78,89 @@ async function fetchDelpherOcr(documentId: string): Promise<string | undefined> 
     return paragraphs.length ? paragraphs.join(" ").slice(0, 4000) : undefined;
   } catch {
     return undefined;
+  }
+}
+
+const DELPHER_PDF_DIR = path.join(os.tmpdir(), "newspapers-mcp-delpher");
+
+function delpherCacheKey(value: string): string {
+  return createHash("sha1").update(value).digest("hex");
+}
+
+/** Keep the PDF cache bounded; entries are only useful to a warm, long-running process. */
+function pruneDelpherPdfs(keep = 20): void {
+  try {
+    const files = fs.readdirSync(DELPHER_PDF_DIR)
+      .filter(f => f.endsWith(".pdf"))
+      .map(f => ({ file: f, mtime: fs.statSync(path.join(DELPHER_PDF_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const { file } of files.slice(keep)) {
+      fs.unlinkSync(path.join(DELPHER_PDF_DIR, file));
+    }
+  } catch {
+    // Pruning is best-effort; a full cache must never fail a request.
+  }
+}
+
+/**
+ * Last-resort Delpher image source: some issues have no page scans in the image API but
+ * do have an issue-level PDF. Render the requested page from it with poppler's `pdftoppm`,
+ * at a fixed width so `snippet_coords` keeps the same coordinate space as the normal route.
+ * The PDF (~7 MB) is cached in the temp directory; rendered pages are not, because a
+ * full-resolution render is about as large as the PDF itself.
+ */
+async function renderDelpherPdfPage(
+  documentId: string,
+  width: number,
+): Promise<{ buffer?: Buffer; error?: string }> {
+  const match = documentId.match(/^(.*):p(\d+)$/);
+  if (!match) return { error: "not a page id (expected …:p00004)" };
+  const issueId = match[1];
+  const page = Number(match[2]);
+  const key = delpherCacheKey(issueId);
+  const pdfPath = path.join(DELPHER_PDF_DIR, `${key}.pdf`);
+
+  try {
+    fs.mkdirSync(DELPHER_PDF_DIR, { recursive: true });
+
+    if (!fs.existsSync(pdfPath)) {
+      const pdf = await axios.get(
+        `https://resolver.kb.nl/resolve?urn=${encodeURIComponent(issueId)}:pdf`,
+        {
+          responseType: "arraybuffer",
+          headers: { "User-Agent": "newspapers-mcp/1.0" },
+          timeout: 120000,
+          validateStatus: status => status === 200,
+        },
+      );
+      fs.writeFileSync(pdfPath, Buffer.from(pdf.data));
+      pruneDelpherPdfs();
+    }
+
+    // Render to a per-request file: full-resolution renders are ~7 MB, so only the
+    // (much more expensive to fetch) PDF is kept between calls.
+    const prefix = path.join(DELPHER_PDF_DIR, `${key}-p${page}-w${width}-${process.pid}-${Date.now()}`);
+    const jpgPath = `${prefix}.jpg`;
+    const render = spawnSync(
+      "pdftoppm",
+      [
+        "-f", String(page), "-l", String(page),
+        "-scale-to-x", String(width), "-scale-to-y", "-1",
+        "-jpeg", "-singlefile", pdfPath, prefix,
+      ],
+      { timeout: 120000 },
+    );
+    if (render.error) return { error: `pdftoppm failed: ${render.error.message}` };
+    if (render.status !== 0) {
+      try { fs.unlinkSync(jpgPath); } catch { /* nothing to clean up */ }
+      return { error: `pdftoppm exited ${render.status}: ${String(render.stderr).slice(0, 200)}` };
+    }
+    if (!fs.existsSync(jpgPath)) return { error: "pdftoppm produced no output" };
+    const buffer = fs.readFileSync(jpgPath);
+    try { fs.unlinkSync(jpgPath); } catch { /* best-effort cache cleanup */ }
+    return { buffer };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -192,7 +279,7 @@ server.registerTool(
   "newspapers_get_snippet",
   {
     title: "Get Newspaper Snippet Image",
-    description: "Fetch a newspaper snippet image and return it as base64. Use with snippet coordinates from search results. Supported sources: digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia. Delpher pages are fetched as JPEG from Delpher's download API; a crop is applied with ImageMagick and the result is capped at 1600px.",
+    description: "Fetch a newspaper snippet image and return it as base64. Use with snippet coordinates from search results. Supported sources: digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia. Delpher pages are fetched as JPEG from Delpher's download API; a crop is applied with ImageMagick and the result is capped at 1600px. For Delpher page ids without a served scan, set allow_pdf_fallback to render the page from the issue PDF (slower).",
     inputSchema: z.object({
       source: z.enum(["digipress", "chronicling_america", "gallica", "europeana", "anno", "delpher", "ddb", "eluxemburgensia"])
         .describe("The archive source (digipress, chronicling_america, gallica, europeana, anno, delpher, ddb, eluxemburgensia)"),
@@ -200,12 +287,15 @@ server.registerTool(
         .describe("Document/page identifier from the archive (e.g. 'bsb10001591_00035' for digiPress, 'service:ndnp:...:0003' for Chronicling America, 'bpt6k5460422k/f173' for Gallica, full imageURL for ANNO, 'ddd:...:mpeg21:p010' for Delpher, UUID for DDB, 'ark:70795/.../pages/1' for eLuxemburgensia)"),
       snippet_coords: z.string().optional()
         .describe("IIIF region coordinates for the snippet crop (e.g. 'pct:0,11.5,100,3.6' for digiPress, 'x,y,w,h' pixel coords for Gallica and Delpher). Not used for ANNO (imageURL already contains crop). Delpher coords are relative to the 6000px-wide page image. If omitted, returns the full page."),
+      allow_pdf_fallback: z.boolean().optional().default(false)
+        .describe("Delpher page ids only: if the image API has no scan for the page, render it from the issue PDF instead. Downloads ~7 MB per issue (cached) and needs poppler's pdftoppm, so it is off by default."),
     }),
   },
-  async ({ source, document_id, snippet_coords }) => {
+  async ({ source, document_id, snippet_coords, allow_pdf_fallback }) => {
     try {
       let imageUrl: string;
       let cropJpeg = false;
+      let pdfFallbackNote: string | undefined;
       const region = snippet_coords || "full";
 
       switch (source) {
@@ -284,12 +374,34 @@ server.registerTool(
             ],
           };
         }
-        const issueId = document_id.replace(/:p\d+$/, "");
-        throw new Error(
-          `KB image route unavailable for ${document_id}: ${detail}. ` +
-          `Delpher does not serve a page scan for this id; the issue PDF may still be available at ` +
-          `https://resolver.kb.nl/resolve?urn=${issueId}:pdf.`,
-        );
+
+        let fallbackError: string;
+        if (allow_pdf_fallback) {
+          // Render from the issue PDF at the same width the normal route would use,
+          // so snippet_coords keeps its 6000px coordinate space.
+          const width = snippet_coords ? 6000 : 1600;
+          const rendered = await renderDelpherPdfPage(document_id, width);
+          if (rendered.buffer) {
+            bytes = rendered.buffer;
+            mimeType = "image/jpeg";
+            pdfFallbackNote =
+              `Delpher serves no page scan for ${document_id}; page rendered from the issue PDF ` +
+              `at ${width}px wide (cached). Crop coordinates are relative to that width.`;
+            fallbackError = "";
+          } else {
+            fallbackError = `PDF fallback failed: ${rendered.error}`;
+          }
+        } else {
+          fallbackError = "Retry with allow_pdf_fallback: true to render the page from the issue PDF";
+        }
+
+        if (fallbackError) {
+          const issueId = document_id.replace(/:p\d+$/, "");
+          throw new Error(
+            `KB image route unavailable for ${document_id}: ${detail}. ${fallbackError}. ` +
+            `The issue PDF is at https://resolver.kb.nl/resolve?urn=${issueId}:pdf.`,
+          );
+        }
       }
 
       if (cropJpeg || /jp2|jpeg\s*-?\s*2000/i.test(mimeType)) {
@@ -322,8 +434,9 @@ server.registerTool(
 
       return {
         content: [
+          ...(pdfFallbackNote ? [{ type: "text" as const, text: pdfFallbackNote }] : []),
           {
-            type: "image",
+            type: "image" as const,
             data: base64,
             mimeType,
           },

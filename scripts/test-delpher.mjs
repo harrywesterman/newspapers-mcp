@@ -6,10 +6,12 @@
  *   npm run build && node scripts/test-delpher.mjs
  *
  * Live archive data: assertions are about shape and filtering, not about exact hit counts.
- * Requires ImageMagick (`magick`) on PATH for the snippet crop test.
+ * Requires ImageMagick (`magick`) on PATH for the snippet crop test, and poppler's
+ * `pdftoppm` for the issue-PDF fallback test (skipped when pdftoppm is not installed).
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -81,9 +83,39 @@ const unavailable = await client.callTool({
 const unavailableText = text(unavailable);
 check(
   "unavailable scan fails explicitly",
-  !unavailable.content.some(c => c.type === "image") && unavailableText.includes("KB image route unavailable"),
+  !unavailable.content.some(c => c.type === "image") &&
+    unavailableText.includes("KB image route unavailable") &&
+    unavailableText.includes("allow_pdf_fallback"),
   unavailableText.slice(0, 200),
 );
+
+// 8. the issue-PDF fallback must render a real JPEG for the ddd collection
+const hasPdftoppm = spawnSync("pdftoppm", ["-v"], { stdio: "ignore" }).status === 0;
+if (!hasPdftoppm) {
+  console.log("SKIP  PDF fallback (pdftoppm not on PATH)");
+} else {
+  const r = await client.callTool({
+    name: "newspapers_get_snippet",
+    arguments: {
+      source: "delpher",
+      document_id: "ddd:010327636:mpeg21:p00004",
+      allow_pdf_fallback: true,
+    },
+  });
+  const img = r.content.find(c => c.type === "image");
+  if (!img) {
+    check("PDF fallback", false, text(r).slice(0, 200));
+  } else {
+    const buf = Buffer.from(img.data, "base64");
+    const jpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[buf.length - 2] === 0xff && buf[buf.length - 1] === 0xd9;
+    check(
+      "PDF fallback renders a JPEG",
+      img.mimeType === "image/jpeg" && jpeg && buf.length > 10_000 &&
+        text(r).includes("rendered from the issue PDF"),
+      `${img.mimeType}, ${buf.length} bytes`,
+    );
+  }
+}
 
 await client.close();
 console.log(failures ? `\n${failures} check(s) failed` : "\nall checks passed");

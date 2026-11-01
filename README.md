@@ -267,12 +267,22 @@ instead requests a server-rendered JPEG from Delpher's download API
 the page is fetched at 6000 px and cropped with ImageMagick (`magick` must be on `PATH`), with
 `x,y,w,h` interpreted in that 6000 px coordinate space, then capped at 1600 px.
 
-Not every page has a served scan: some issues (e.g. `ddd:010327636`) only expose the issue PDF and
-OCR. In that case `newspapers_get_snippet` returns an explicit `KB image route unavailable` message
-instead of a raw axios 404, and for article ids (`…:a0108`) it falls back to the `:ocr` text.
+Not every page has a served scan: a subset of the `ddd` collection (e.g. `ddd:010327636`,
+Nieuwsblad van het Noorden 18-12-1940) has no access JP2 in the KB resolver at all. The resolver
+still answers `:image` with a filename, but the file is missing, and the imageviewer's
+`Redirect not allowed` guard points back at that same dead route — following `Content-Location`
+does not produce an image. What does work is the issue-level PDF
+(`https://resolver.kb.nl/resolve?urn=<issue>:pdf`).
 
-Run `npm run test:delpher` against a live KB to check dates, the newspaper filter and
-snippet fetching end to end.
+`newspapers_get_snippet` therefore returns an explicit `KB image route unavailable` message by
+default, with a hint to retry using `allow_pdf_fallback: true`. With that flag the page number is
+taken from the id (`…:p00004` = page 4), the issue PDF is downloaded once (~7 MB), and
+poppler's `pdftoppm` renders that page at 1600 px (or 6000 px when cropping). PDFs and rendered
+pages are cached under the system temp directory; `pdftoppm` must be on `PATH` for this path.
+Article ids (`…:a0108`) fall back to the `:ocr` text instead.
+
+Run `npm run test:delpher` against a live KB to check dates, the newspaper filter, snippet
+fetching and the PDF fallback end to end.
 
 ### Europeana
 - Coverage: Multiple European countries
